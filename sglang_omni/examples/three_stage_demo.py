@@ -20,7 +20,7 @@ from typing import Any
 
 sys.path.insert(0, "/vllm-workspace/sglang-omni")
 
-from sglang_omni.coordinator import Coordinator
+from sglang_omni import Coordinator
 
 logging.basicConfig(
     level=logging.INFO,
@@ -35,22 +35,29 @@ STAGE3_ENDPOINT = "tcp://127.0.0.1:16003"
 COORDINATOR_ENDPOINT = "tcp://127.0.0.1:16000"
 ABORT_ENDPOINT = "tcp://127.0.0.1:16099"
 
+# All endpoints for routing
+ENDPOINTS = {
+    "preprocessor": STAGE1_ENDPOINT,
+    "encoder": STAGE2_ENDPOINT,
+    "decoder": STAGE3_ENDPOINT,
+}
 
-def stage1_get_next(request_id: str, output: Any) -> tuple[str, str] | None:
+
+def stage1_get_next(request_id: str, output: Any) -> str | None:
     """Preprocessor always routes to Encoder."""
-    return ("encoder", STAGE2_ENDPOINT)
+    return "encoder"
 
 
-def stage2_get_next(request_id: str, output: Any) -> tuple[str, str] | None:
+def stage2_get_next(request_id: str, output: Any) -> str | None:
     """Encoder routes to Decoder, or early-exits if output < 0."""
     # Early exit condition: if output is negative, skip decoder
     if isinstance(output, (int, float)) and output < 0:
         logger.info("Encoder: output=%s is negative, early exit!", output)
         return None  # END
-    return ("decoder", STAGE3_ENDPOINT)
+    return "decoder"
 
 
-def stage3_get_next(request_id: str, output: Any) -> tuple[str, str] | None:
+def stage3_get_next(request_id: str, output: Any) -> str | None:
     """Decoder is the final stage."""
     return None  # END
 
@@ -60,23 +67,26 @@ def run_stage(name: str, endpoint: str, transform, delay: float, get_next):
     import asyncio
     import logging
 
-    from sglang_omni.scheduler import EchoWorker
-    from sglang_omni.stage import Stage
+    from sglang_omni import EchoEngine, Stage, Worker
 
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
 
-    worker = EchoWorker(transform=transform, delay=delay)
+    engine = EchoEngine(transform=transform, delay=delay)
+    worker = Worker(engine)
+
     stage = Stage(
         name=name,
-        worker=worker,
         get_next=get_next,
         recv_endpoint=endpoint,
         coordinator_endpoint=COORDINATOR_ENDPOINT,
         abort_endpoint=ABORT_ENDPOINT,
+        endpoints=ENDPOINTS,
     )
+    stage.add_worker(worker)
+
     asyncio.run(stage.run())
 
 

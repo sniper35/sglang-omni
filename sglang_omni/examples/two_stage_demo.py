@@ -22,7 +22,7 @@ from typing import Any
 # Add parent directory to path for imports
 sys.path.insert(0, "/vllm-workspace/sglang-omni")
 
-from sglang_omni.coordinator import Coordinator
+from sglang_omni import Coordinator
 
 # Configure logging
 logging.basicConfig(
@@ -37,13 +37,19 @@ STAGE2_ENDPOINT = "tcp://127.0.0.1:15002"
 COORDINATOR_ENDPOINT = "tcp://127.0.0.1:15000"
 ABORT_ENDPOINT = "tcp://127.0.0.1:15099"
 
+# All endpoints for routing
+ENDPOINTS = {
+    "stage1": STAGE1_ENDPOINT,
+    "stage2": STAGE2_ENDPOINT,
+}
 
-def stage1_get_next(request_id: str, output: Any) -> tuple[str, str] | None:
+
+def stage1_get_next(request_id: str, output: Any) -> str | None:
     """Stage 1 always routes to Stage 2."""
-    return ("stage2", STAGE2_ENDPOINT)
+    return "stage2"
 
 
-def stage2_get_next(request_id: str, output: Any) -> tuple[str, str] | None:
+def stage2_get_next(request_id: str, output: Any) -> str | None:
     """Stage 2 is the final stage."""
     return None  # END
 
@@ -52,25 +58,26 @@ def run_stage1():
     """Run Stage 1 in a separate process."""
     import asyncio
 
-    from sglang_omni.scheduler import EchoWorker
-    from sglang_omni.stage import Stage
+    from sglang_omni import EchoEngine, Stage, Worker
 
     logging.basicConfig(
         level=logging.DEBUG,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
 
-    # Worker that doubles the input
-    worker = EchoWorker(transform=lambda x: x * 2, delay=0.1)
+    # Engine that doubles the input
+    engine = EchoEngine(transform=lambda x: x * 2, delay=0.1)
+    worker = Worker(engine)
 
     stage = Stage(
         name="stage1",
-        worker=worker,
         get_next=stage1_get_next,
         recv_endpoint=STAGE1_ENDPOINT,
         coordinator_endpoint=COORDINATOR_ENDPOINT,
         abort_endpoint=ABORT_ENDPOINT,
+        endpoints=ENDPOINTS,
     )
+    stage.add_worker(worker)
 
     asyncio.run(stage.run())
 
@@ -79,25 +86,26 @@ def run_stage2():
     """Run Stage 2 in a separate process."""
     import asyncio
 
-    from sglang_omni.scheduler import EchoWorker
-    from sglang_omni.stage import Stage
+    from sglang_omni import EchoEngine, Stage, Worker
 
     logging.basicConfig(
         level=logging.DEBUG,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
 
-    # Worker that adds 100 to the input (with longer delay for abort test)
-    worker = EchoWorker(transform=lambda x: x + 100, delay=0.5)
+    # Engine that adds 100 (with longer delay for abort test)
+    engine = EchoEngine(transform=lambda x: x + 100, delay=0.5)
+    worker = Worker(engine)
 
     stage = Stage(
         name="stage2",
-        worker=worker,
         get_next=stage2_get_next,
         recv_endpoint=STAGE2_ENDPOINT,
         coordinator_endpoint=COORDINATOR_ENDPOINT,
         abort_endpoint=ABORT_ENDPOINT,
+        endpoints=ENDPOINTS,
     )
+    stage.add_worker(worker)
 
     asyncio.run(stage.run())
 

@@ -5,8 +5,7 @@ import asyncio
 import logging
 from typing import Any
 
-from sglang_omni.control_plane import CoordinatorControlPlane
-from sglang_omni.types import (
+from sglang_omni.core.types import (
     AbortMessage,
     CompleteMessage,
     RequestInfo,
@@ -14,6 +13,7 @@ from sglang_omni.types import (
     StageInfo,
     SubmitMessage,
 )
+from sglang_omni.transport.control_plane import CoordinatorControlPlane
 
 logger = logging.getLogger(__name__)
 
