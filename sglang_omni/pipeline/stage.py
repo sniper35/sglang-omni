@@ -7,7 +7,7 @@ import asyncio
 import logging
 from typing import Any, Callable
 
-from sglang_omni.core.types import (
+from sglang_omni.proto import (
     DataReadyMessage,
     ShutdownMessage,
     StageInfo,

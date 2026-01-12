@@ -2,7 +2,7 @@
 """SGLang-Omni: Multi-stage pipeline framework for omni models."""
 
 # Re-export from submodules for convenience
-from sglang_omni.core.types import (
+from sglang_omni.proto import (
     AbortMessage,
     CompleteMessage,
     DataReadyMessage,
