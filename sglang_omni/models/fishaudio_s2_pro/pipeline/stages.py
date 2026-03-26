@@ -309,10 +309,10 @@ def create_sglang_tts_engine_executor(
         model_path=checkpoint_dir,
         tp_size=1,
         dtype="bfloat16",
-        mem_fraction_static=0.85,
+        mem_fraction_static=0.55,
         chunked_prefill_size=8192,
         max_running_requests=64,
-        disable_cuda_graph=False,
+        disable_cuda_graph=True,
     )
 
     engine = create_s2pro_sglang_engine(

@@ -89,7 +89,7 @@ def create_s2pro_sglang_engine(
     _patch_fish_config_for_sglang(server_args.model_path)
 
     if server_args.attention_backend is None:
-        server_args.attention_backend = "fa3"
+        server_args.attention_backend = "flashinfer"
 
     # Enable hidden state capture for unified decode
     want_cuda_graph = not server_args.disable_cuda_graph
