@@ -11,10 +11,11 @@ import base64
 import io
 import json
 import sys
+import time
 import wave
 from pathlib import Path
 from typing import Iterator
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import numpy as np
 import pytest
@@ -38,6 +39,7 @@ def _import_app():
     # Build a minimal gr stub with Warning as a no-op.
     gr_stub = types.ModuleType("gradio")
     gr_stub.Warning = lambda *a, **kw: None  # type: ignore[attr-defined]
+    gr_stub.State = lambda *a, **kw: None  # type: ignore[attr-defined]
     sys.modules.setdefault("gradio", gr_stub)
 
     import app as _app
@@ -100,6 +102,16 @@ def _make_finish_line(index: int = 1) -> str:
         "usage": {"prompt_tokens": 10, "completion_tokens": 50, "total_tokens": 60},
     }
     return f"data: {json.dumps(payload)}"
+
+
+def _make_mock_stream_yields(
+    sr: int, chunk_size: int, n_chunks: int
+) -> list[tuple[int, np.ndarray]]:
+    """Build the list of (sample_rate, numpy) tuples that
+    synthesize_speech_stream would yield."""
+    return [
+        (sr, np.zeros(chunk_size, dtype=np.float32)) for _ in range(n_chunks)
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -404,66 +416,218 @@ class TestSynthesizeSpeechStream:
 
 
 # ---------------------------------------------------------------------------
-# Gradio generator / history lifecycle tests
+# Three-step lifecycle tests: _prepare → _synthesize → _finalize
 # ---------------------------------------------------------------------------
 
 
-def _make_mock_stream_yields(
-    sr: int, chunk_size: int, n_chunks: int
-) -> list[tuple[int, np.ndarray]]:
-    """Build the list of (sample_rate, numpy) tuples that
-    synthesize_speech_stream would yield."""
-    return [
-        (sr, np.zeros(chunk_size, dtype=np.float32)) for _ in range(n_chunks)
-    ]
-
-
-class TestStreamingPathLifecycle:
-    """Tests that _streaming_path yields correct history and audio sequence."""
+class TestPrepare:
+    """Tests for the _prepare step."""
 
     @pytest.fixture(autouse=True)
     def _load_app(self):
         self.app = _import_app()
 
-    def test_immediate_placeholder_yield(self):
-        """First yield must show 'Generating (streaming)...' with no audio,
-        before any audio arrives."""
-        sr = 44100
-        chunks = _make_mock_stream_yields(sr, 1000, 2)
+    def test_empty_text_returns_none_state(self):
+        """Empty text should return unchanged history and None state."""
+        history, state = self.app._prepare(
+            False, "   ", None, "", 0.8, 0.8, 30, 2048, []
+        )
+        assert history == []
+        assert state is None
 
-        with patch(
-            "app.synthesize_speech_stream", return_value=iter(chunks)
-        ):
-            gen = self.app._streaming_path(
-                "http://fake", {"input": "hi", "stream": True}, [], ["hi"]
-            )
-            first_history, first_audio = next(gen)
+    def test_streaming_placeholder(self):
+        """Streaming mode should show 'Generating (streaming)...' placeholder."""
+        history, state = self.app._prepare(
+            True, "hello", None, "", 0.8, 0.8, 30, 2048, []
+        )
+        assert state is not None
+        assert state["stream_on"] is True
+        assert len(history) == 2
+        assert "streaming" in history[1]["content"].lower()
 
-        assert first_audio is None
-        assert len(first_history) == 2
-        assert first_history[1]["content"] == "Generating (streaming)..."
+    def test_non_streaming_placeholder(self):
+        """Non-streaming mode should show 'Generating (non-streaming)...'."""
+        history, state = self.app._prepare(
+            False, "hello", None, "", 0.8, 0.8, 30, 2048, []
+        )
+        assert state is not None
+        assert state["stream_on"] is False
+        assert "non-streaming" in history[1]["content"].lower()
 
-    def test_final_history_has_audio_path(self):
-        """After streaming, the last history entry must contain a WAV file
-        path so the result is replayable."""
+    def test_ref_audio_not_embedded(self):
+        """Reference audio should NOT be embedded as an inline player."""
+        history, state = self.app._prepare(
+            True, "hello", "/tmp/ref.wav", "transcript", 0.8, 0.8, 30, 2048, []
+        )
+        user_content = history[0]["content"]
+        # User content should include text but no audio file path dict.
+        assert any(isinstance(item, str) and "hello" in item for item in user_content)
+        assert not any(
+            isinstance(item, dict) and "path" in item for item in user_content
+        )
+
+    def test_state_has_payload(self):
+        """State dict must contain the API payload."""
+        _, state = self.app._prepare(
+            True, "hello", None, "", 0.8, 0.8, 30, 2048, []
+        )
+        assert "payload" in state
+        assert state["payload"]["input"] == "hello"
+        assert state["payload"]["stream"] is True
+
+    def test_state_has_accumulators(self):
+        """State dict must have mutable accumulators for _synthesize."""
+        _, state = self.app._prepare(
+            True, "hello", None, "", 0.8, 0.8, 30, 2048, []
+        )
+        assert state["samples"] == []
+        assert state["chunk_count"] == 0
+        assert state["error"] is None
+
+
+class TestSynthesize:
+    """Tests for the _synthesize step."""
+
+    @pytest.fixture(autouse=True)
+    def _load_app(self):
+        self.app = _import_app()
+
+    def test_none_state_returns_nothing(self):
+        """When state is None (invalid input), nothing is yielded."""
+        yields = list(self.app._synthesize(None, api_base="http://fake"))
+        assert yields == []
+
+    def test_streaming_yields_audio_chunks(self):
+        """Streaming mode yields (sr, numpy) tuples from the stream."""
         sr = 44100
         chunks = _make_mock_stream_yields(sr, 1000, 3)
 
+        state = {
+            "payload": {"input": "hi", "stream": True, "response_format": "pcm"},
+            "stream_on": True,
+            "t0": time.perf_counter(),
+            "samples": [],
+            "sr": 24000,
+            "chunk_count": 0,
+            "wav_bytes": None,
+            "error": None,
+        }
+
         with patch(
             "app.synthesize_speech_stream", return_value=iter(chunks)
         ):
-            yields = list(
-                self.app._streaming_path(
-                    "http://fake", {"input": "hi", "stream": True}, [], ["hi"]
-                )
-            )
+            yields = list(self.app._synthesize(state, api_base="http://fake"))
 
-        # Last yield is the finalized history.
-        final_history, final_audio = yields[-1]
-        assistant = final_history[-1]
-        content = assistant["content"]
+        assert len(yields) == 3
+        for yielded_sr, arr in yields:
+            assert yielded_sr == sr
+            assert isinstance(arr, np.ndarray)
 
-        # Must be a list with an audio dict and a stats string.
+        # State should be mutated in-place with accumulated data.
+        assert len(state["samples"]) == 3
+        assert state["sr"] == sr
+        assert state["chunk_count"] == 3
+
+    def test_non_streaming_yields_once(self):
+        """Non-streaming mode yields the full audio exactly once."""
+        sr = 24000
+        samples = np.array([100, -100, 0], dtype=np.int16)
+        wav_bytes = _make_wav_bytes(samples, sample_rate=sr)
+
+        state = {
+            "payload": {"input": "hi", "stream": False, "response_format": "wav"},
+            "stream_on": False,
+            "t0": time.perf_counter(),
+            "samples": [],
+            "sr": 24000,
+            "chunk_count": 0,
+            "wav_bytes": None,
+            "error": None,
+        }
+
+        with patch("app.synthesize_speech", return_value=wav_bytes):
+            yields = list(self.app._synthesize(state, api_base="http://fake"))
+
+        assert len(yields) == 1
+        yielded_sr, arr = yields[0]
+        assert yielded_sr == sr
+        assert len(arr) == 3
+        assert state["wav_bytes"] == wav_bytes
+
+    def test_error_stored_in_state(self):
+        """When synthesis fails, the error is stored in state (not raised)."""
+        state = {
+            "payload": {"input": "hi", "stream": False, "response_format": "wav"},
+            "stream_on": False,
+            "t0": time.perf_counter(),
+            "samples": [],
+            "sr": 24000,
+            "chunk_count": 0,
+            "wav_bytes": None,
+            "error": None,
+        }
+
+        with patch(
+            "app.synthesize_speech",
+            side_effect=ConnectionError("no server"),
+        ):
+            yields = list(self.app._synthesize(state, api_base="http://fake"))
+
+        assert yields == []
+        assert "no server" in state["error"]
+
+
+class TestFinalize:
+    """Tests for the _finalize step."""
+
+    @pytest.fixture(autouse=True)
+    def _load_app(self):
+        self.app = _import_app()
+
+    def test_none_state_returns_history_unchanged(self):
+        """When state is None, history is returned as-is."""
+        history = [{"role": "user", "content": "hi"}]
+        result = self.app._finalize(history, None)
+        assert result is history
+
+    def test_error_in_state(self):
+        """When state has an error, history shows the error message."""
+        history = [
+            {"role": "user", "content": ["hi"]},
+            {"role": "assistant", "content": "Generating..."},
+        ]
+        state = {
+            "t0": time.perf_counter(),
+            "stream_on": False,
+            "samples": [],
+            "sr": 24000,
+            "chunk_count": 0,
+            "wav_bytes": None,
+            "error": "no server",
+        }
+        result = self.app._finalize(history, state)
+        assert "Error" in result[-1]["content"]
+        assert "no server" in result[-1]["content"]
+
+    def test_streaming_finalize_has_wav_and_stats(self):
+        """After streaming, the history must contain a WAV path and stats."""
+        sr = 44100
+        state = {
+            "t0": time.perf_counter() - 1.0,  # 1 second ago
+            "stream_on": True,
+            "samples": [np.zeros(1000, dtype=np.float32)],
+            "sr": sr,
+            "chunk_count": 3,
+            "wav_bytes": None,
+            "error": None,
+        }
+        history = [
+            {"role": "user", "content": ["hi"]},
+            {"role": "assistant", "content": "Generating (streaming)..."},
+        ]
+        result = self.app._finalize(history, state)
+        content = result[-1]["content"]
+
         assert isinstance(content, list)
         assert any(
             isinstance(item, dict) and item.get("mime_type") == "audio/wav"
@@ -471,164 +635,127 @@ class TestStreamingPathLifecycle:
         )
         assert any(isinstance(item, str) and "chunks" in item for item in content)
 
-        # Final audio must be None — gr.Audio(streaming=True) accumulates
-        # chunks internally, so re-sending the full waveform would duplicate.
-        assert final_audio is None
+    def test_non_streaming_finalize_has_wav_and_stats(self):
+        """After non-streaming, the history must contain a WAV path and stats."""
+        sr = 24000
+        samples = np.array([100, -100, 0], dtype=np.int16)
+        wav_bytes = _make_wav_bytes(samples, sample_rate=sr)
 
-    def test_streaming_yields_audio_chunks(self):
-        """Intermediate yields must carry audio data (not None)."""
-        sr = 44100
-        chunks = _make_mock_stream_yields(sr, 500, 2)
+        state = {
+            "t0": time.perf_counter() - 0.5,
+            "stream_on": False,
+            "samples": [np.zeros(3, dtype=np.float32)],
+            "sr": sr,
+            "chunk_count": 0,
+            "wav_bytes": wav_bytes,
+            "error": None,
+        }
+        history = [
+            {"role": "user", "content": ["hi"]},
+            {"role": "assistant", "content": "Generating (non-streaming)..."},
+        ]
+        result = self.app._finalize(history, state)
+        content = result[-1]["content"]
 
-        with patch(
-            "app.synthesize_speech_stream", return_value=iter(chunks)
-        ):
-            yields = list(
-                self.app._streaming_path(
-                    "http://fake", {"input": "hi", "stream": True}, [], ["hi"]
-                )
-            )
-
-        # First yield: placeholder (audio=None).
-        # Next yields: audio chunks.
-        # Last yield: finalized history (audio=None, no re-send).
-        audio_yields = [(h, a) for h, a in yields if a is not None]
-        # Only the 2 streaming chunks carry audio.
-        assert len(audio_yields) == 2
-
-    def test_error_during_streaming(self):
-        """If streaming fails mid-stream, history shows the error."""
-
-        def _failing_stream(*args, **kwargs):
-            yield (44100, np.zeros(100, dtype=np.float32))
-            raise ConnectionError("server gone")
-
-        with patch(
-            "app.synthesize_speech_stream", side_effect=_failing_stream
-        ):
-            yields = list(
-                self.app._streaming_path(
-                    "http://fake", {"input": "hi", "stream": True}, [], ["hi"]
-                )
-            )
-
-        final_history, final_audio = yields[-1]
-        assert "Streaming error" in final_history[-1]["content"]
-        assert final_audio is None
+        assert isinstance(content, list)
+        assert any(
+            isinstance(item, dict) and item.get("mime_type") == "audio/wav"
+            for item in content
+        )
+        assert any(isinstance(item, str) and "KB" in item for item in content)
 
 
-class TestNonStreamingPathLifecycle:
-    """Tests that _non_streaming_path yields correct history and audio."""
+class TestFullLifecycle:
+    """End-to-end tests: _prepare → _synthesize → _finalize."""
 
     @pytest.fixture(autouse=True)
     def _load_app(self):
         self.app = _import_app()
 
-    def test_history_contains_audio_and_stats(self):
-        """Non-streaming result must have WAV path and timing in history."""
-        # Build a tiny WAV.
-        sr = 24000
-        samples = np.array([100, -100, 0], dtype=np.int16)
-        wav_bytes = _make_wav_bytes(samples, sample_rate=sr)
+    def test_streaming_lifecycle(self):
+        """Full streaming lifecycle produces correct history and audio."""
+        sr = 44100
+        chunks = _make_mock_stream_yields(sr, 1000, 2)
 
-        with patch("app.synthesize_speech", return_value=wav_bytes):
-            yields = list(
-                self.app._non_streaming_path(
-                    "http://fake",
-                    {"input": "hi"},
-                    [],
-                    ["hi"],
-                )
+        # Step 1: prepare
+        history, state = self.app._prepare(
+            True, "hello", None, "", 0.8, 0.8, 30, 2048, []
+        )
+        assert state is not None
+        assert len(history) == 2
+        assert "streaming" in history[1]["content"].lower()
+
+        # Step 2: synthesize
+        with patch(
+            "app.synthesize_speech_stream", return_value=iter(chunks)
+        ):
+            audio_yields = list(
+                self.app._synthesize(state, api_base="http://fake")
             )
 
-        assert len(yields) == 1
-        history, audio = yields[0]
+        # Audio chunks are yielded directly (no history tuples).
+        assert len(audio_yields) == 2
+        for yielded_sr, arr in audio_yields:
+            assert yielded_sr == sr
 
-        # History has user + assistant messages.
-        assert len(history) == 2
-        assistant = history[1]
-        content = assistant["content"]
+        # Step 3: finalize
+        history = self.app._finalize(history, state)
+        content = history[-1]["content"]
         assert isinstance(content, list)
         assert any(
             isinstance(item, dict) and item.get("mime_type") == "audio/wav"
             for item in content
         )
 
-        # Audio output is (sample_rate, numpy).
-        assert audio is not None
-        assert audio[0] == sr
-        assert len(audio[1]) == 3
+    def test_non_streaming_lifecycle(self):
+        """Full non-streaming lifecycle produces correct history and audio."""
+        sr = 24000
+        samples = np.array([100, -100, 0], dtype=np.int16)
+        wav_bytes = _make_wav_bytes(samples, sample_rate=sr)
 
-    def test_error_in_non_streaming(self):
-        """When synthesis fails, history shows the error, audio is None."""
+        # Step 1: prepare
+        history, state = self.app._prepare(
+            False, "hello", None, "", 0.8, 0.8, 30, 2048, []
+        )
+        assert state is not None
+
+        # Step 2: synthesize
+        with patch("app.synthesize_speech", return_value=wav_bytes):
+            audio_yields = list(
+                self.app._synthesize(state, api_base="http://fake")
+            )
+
+        assert len(audio_yields) == 1
+        assert audio_yields[0][0] == sr
+
+        # Step 3: finalize
+        history = self.app._finalize(history, state)
+        content = history[-1]["content"]
+        assert isinstance(content, list)
+        assert any(
+            isinstance(item, dict) and item.get("mime_type") == "audio/wav"
+            for item in content
+        )
+
+    def test_error_lifecycle(self):
+        """When synthesis fails, the error is shown in history."""
+        # Step 1: prepare
+        history, state = self.app._prepare(
+            False, "hello", None, "", 0.8, 0.8, 30, 2048, []
+        )
+
+        # Step 2: synthesize (fails)
         with patch(
             "app.synthesize_speech",
             side_effect=ConnectionError("no server"),
         ):
-            yields = list(
-                self.app._non_streaming_path(
-                    "http://fake", {"input": "hi"}, [], ["hi"]
-                )
+            audio_yields = list(
+                self.app._synthesize(state, api_base="http://fake")
             )
 
-        history, audio = yields[0]
+        assert audio_yields == []
+
+        # Step 3: finalize
+        history = self.app._finalize(history, state)
         assert "Error" in history[-1]["content"]
-        assert audio is None
-
-
-class TestDispatch:
-    """Tests the top-level _dispatch routing."""
-
-    @pytest.fixture(autouse=True)
-    def _load_app(self):
-        self.app = _import_app()
-
-    def test_empty_text_warns(self):
-        """Empty text should yield unchanged history and None audio."""
-        yields = list(
-            self.app._dispatch(
-                False, "   ", None, "", 0.8, 0.8, 30, 2048, [], "http://fake"
-            )
-        )
-        assert len(yields) == 1
-        history, audio = yields[0]
-        assert history == []
-        assert audio is None
-
-    def test_dispatch_routes_to_streaming(self):
-        """When stream_on=True, dispatch must call the streaming path."""
-        sr = 44100
-        chunks = _make_mock_stream_yields(sr, 500, 1)
-
-        with patch(
-            "app.synthesize_speech_stream", return_value=iter(chunks)
-        ):
-            yields = list(
-                self.app._dispatch(
-                    True, "hello", None, "", 0.8, 0.8, 30, 2048,
-                    [], "http://fake",
-                )
-            )
-
-        # Streaming: placeholder + chunk(s) + final.
-        assert len(yields) >= 2
-        # First yield is the placeholder.
-        assert yields[0][1] is None
-
-    def test_dispatch_routes_to_non_streaming(self):
-        """When stream_on=False, dispatch must call the non-streaming path."""
-        sr = 24000
-        wav_bytes = _make_wav_bytes(np.zeros(100, dtype=np.int16), sr)
-
-        with patch("app.synthesize_speech", return_value=wav_bytes):
-            yields = list(
-                self.app._dispatch(
-                    False, "hello", None, "", 0.8, 0.8, 30, 2048,
-                    [], "http://fake",
-                )
-            )
-
-        assert len(yields) == 1
-        history, audio = yields[0]
-        assert len(history) == 2
-        assert audio is not None
+        assert "no server" in history[-1]["content"]

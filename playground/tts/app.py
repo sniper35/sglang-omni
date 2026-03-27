@@ -3,13 +3,21 @@
 
 Supports both non-streaming (full audio) and streaming (progressive playback)
 modes via the ``/v1/audio/speech`` endpoint.
+
+The event flow uses ``.then()`` chaining so that audio streaming yields only
+to ``gr.Audio(streaming=True)`` — never alongside a chatbot update in the
+same generator.  This avoids component-reset issues in Gradio where a
+dual-output generator causes the streaming audio component to lose its
+internal accumulation state on each chatbot re-render.
 """
 
 from __future__ import annotations
 
 import argparse
+import io
 import tempfile
 import time
+import wave
 
 import gradio as gr
 import numpy as np
@@ -22,11 +30,11 @@ from api_client import (
 )
 
 # ---------------------------------------------------------------------------
-# Callbacks
+# Step 1: Prepare — validate input, build payload, update chatbot
 # ---------------------------------------------------------------------------
 
 
-def _dispatch(
+def _prepare(
     stream_on: bool,
     text: str,
     ref_audio: str | None,
@@ -36,20 +44,15 @@ def _dispatch(
     top_k: int,
     max_new_tokens: int,
     history: list[dict],
-    api_base: str,
-):
-    """Unified generator: yields ``(history, audio_output)`` tuples.
+) -> tuple[list[dict], dict | None]:
+    """Validate input, build the API payload, and show a chatbot placeholder.
 
-    * Non-streaming — one yield with full audio after synthesis completes.
-    * Streaming — multiple yields with progressive audio chunks.
-
-    The audio output is always ``(sample_rate, float32_numpy)`` which works
-    with ``gr.Audio(streaming=True)``.
+    Returns ``(updated_history, state_dict)`` where *state_dict* is ``None``
+    when the input is invalid (empty text).
     """
     if not text.strip():
         gr.Warning("Please enter some text to synthesize.")
-        yield history, None
-        return
+        return history, None
 
     payload = build_payload(
         text,
@@ -62,128 +65,134 @@ def _dispatch(
         stream=stream_on,
     )
 
+    # Show the target text in the chatbot.  Do NOT embed the reference audio
+    # file — an inline audio player in the chat history creates the false
+    # impression that the reference recording is being played back, when in
+    # fact the audio output is the synthesised voice-cloned speech.
     user_content: list = [text]
     if ref_audio is not None:
-        user_content.append({"path": ref_audio, "mime_type": "audio/wav"})
+        user_content.append("(voice clone reference provided)")
 
-    if stream_on:
-        yield from _streaming_path(api_base, payload, history, user_content)
-    else:
-        yield from _non_streaming_path(api_base, payload, history, user_content)
-
-
-def _non_streaming_path(api_base, payload, history, user_content):
-    """Synthesize fully, then yield once with the result."""
-    t0 = time.perf_counter()
-    try:
-        wav_bytes = synthesize_speech(api_base, payload)
-    except Exception as exc:
-        history = history + [
-            {"role": "user", "content": user_content},
-            {"role": "assistant", "content": f"Error: {exc}"},
-        ]
-        yield history, None
-        return
-
-    elapsed = time.perf_counter() - t0
-
-    tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-    tmp.write(wav_bytes)
-    tmp.close()
-
-    history = history + [
+    mode = "streaming" if stream_on else "non-streaming"
+    new_history = history + [
         {"role": "user", "content": user_content},
-        {
-            "role": "assistant",
-            "content": [
-                {"path": tmp.name, "mime_type": "audio/wav"},
-                f"{elapsed:.1f}s | {len(wav_bytes) / 1024:.0f} KB",
-            ],
-        },
+        {"role": "assistant", "content": f"Generating ({mode})\u2026"},
     ]
-    # Yield as numpy for the streaming-capable audio component.
-    import io
-    import wave
 
-    with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
-        pcm = wf.readframes(wf.getnframes())
-        sr = wf.getframerate()
-    audio_np = np.frombuffer(pcm, dtype=np.int16).copy().astype(np.float32) / 32767.0
-    yield history, (sr, audio_np)
+    state = {
+        "payload": payload,
+        "stream_on": stream_on,
+        "t0": time.perf_counter(),
+        # Mutable accumulators — updated in-place by _synthesize.
+        "samples": [],
+        "sr": 24000,
+        "chunk_count": 0,
+        "wav_bytes": None,
+        "error": None,
+    }
+    return new_history, state
 
 
-def _streaming_path(api_base, payload, history, user_content):
-    """Stream audio chunks, updating history at the end.
+# ---------------------------------------------------------------------------
+# Step 2: Synthesize — generator that yields ONLY to the audio output
+# ---------------------------------------------------------------------------
 
-    After streaming completes the accumulated audio is saved to a temp WAV
-    file and embedded in chat history so the result is replayable — matching
-    the non-streaming path.
+
+def _synthesize(state: dict | None, api_base: str):
+    """Yield ``(sample_rate, float32_numpy)`` tuples to ``gr.Audio``.
+
+    For streaming requests the generator yields multiple times (progressive
+    playback).  For non-streaming it yields once with the full waveform.
+
+    Accumulated samples and metadata are stored in *state* (mutated in-place)
+    so that the follow-up :func:`_finalize` handler can build the chat-history
+    entry without needing the audio component's internal buffer.
     """
-    import io
-    import wave
-
-    # Immediately show the user's message with a "generating..." placeholder
-    # *before* any audio arrives (avoids perceived-latency dead-time while
-    # the prebuffer fills).
-    pending_history = history + [
-        {"role": "user", "content": user_content},
-        {"role": "assistant", "content": "Generating (streaming)..."},
-    ]
-    yield pending_history, None
-
-    t0 = time.perf_counter()
-    chunk_count = 0
-    all_samples: list[np.ndarray] = []
-    last_sr = 24000  # updated from each chunk's envelope
-    try:
-        for sr, audio_chunk in synthesize_speech_stream(api_base, payload):
-            chunk_count += 1
-            all_samples.append(audio_chunk)
-            last_sr = sr
-            yield pending_history, (sr, audio_chunk)
-    except Exception as exc:
-        pending_history[-1] = {
-            "role": "assistant",
-            "content": f"Streaming error: {exc}",
-        }
-        yield pending_history, None
+    if state is None:
         return
 
-    elapsed = time.perf_counter() - t0
-    total_samples = sum(len(s) for s in all_samples)
-    duration = total_samples / last_sr if total_samples else 0
+    try:
+        if state["stream_on"]:
+            for sr, chunk in synthesize_speech_stream(api_base, state["payload"]):
+                state["samples"].append(chunk)
+                state["sr"] = sr
+                state["chunk_count"] += 1
+                yield (sr, chunk)
+        else:
+            wav_bytes = synthesize_speech(api_base, state["payload"])
+            state["wav_bytes"] = wav_bytes
+            with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
+                pcm = wf.readframes(wf.getnframes())
+                sr = wf.getframerate()
+            audio_np = (
+                np.frombuffer(pcm, dtype=np.int16).copy().astype(np.float32)
+                / 32767.0
+            )
+            state["samples"].append(audio_np)
+            state["sr"] = sr
+            yield (sr, audio_np)
+    except Exception as exc:
+        state["error"] = str(exc)
 
-    # Save the full audio to a temp WAV so it appears in chat history.
+
+# ---------------------------------------------------------------------------
+# Step 3: Finalize — update chatbot with WAV file + stats
+# ---------------------------------------------------------------------------
+
+
+def _finalize(history: list[dict], state: dict | None) -> list[dict]:
+    """Replace the chatbot placeholder with a replayable WAV and timing info."""
+    if state is None or not history:
+        return history
+
+    elapsed = time.perf_counter() - state["t0"]
+
+    if state["error"]:
+        history[-1] = {
+            "role": "assistant",
+            "content": f"Error: {state['error']}",
+        }
+        return history
+
+    samples = state["samples"]
+    sr = state["sr"]
+
+    # Save audio to a temp WAV so it appears in the chat history.
     tmp_path: str | None = None
-    if all_samples:
-        full_audio = np.concatenate(all_samples)
+    if state["stream_on"] and samples:
+        full_audio = np.concatenate(samples)
         pcm_int16 = (np.clip(full_audio, -1.0, 1.0) * 32767).astype(np.int16)
         tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
         with wave.open(tmp, "wb") as wf:
             wf.setnchannels(1)
             wf.setsampwidth(2)
-            wf.setframerate(last_sr)
+            wf.setframerate(sr)
             wf.writeframes(pcm_int16.tobytes())
         tmp.close()
         tmp_path = tmp.name
+    elif state["wav_bytes"]:
+        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+        tmp.write(state["wav_bytes"])
+        tmp.close()
+        tmp_path = tmp.name
 
-    # Finalize the history entry with the replayable audio file.
+    total = sum(len(s) for s in samples)
+    duration = total / sr if total else 0
+
     assistant_content: list = []
     if tmp_path:
         assistant_content.append({"path": tmp_path, "mime_type": "audio/wav"})
-    assistant_content.append(
-        f"Streamed {duration:.1f}s audio in {elapsed:.1f}s "
-        f"({chunk_count} chunks)"
-    )
-    pending_history[-1] = {
-        "role": "assistant",
-        "content": assistant_content,
-    }
+    if state["stream_on"]:
+        assistant_content.append(
+            f"Streamed {duration:.1f}s audio in {elapsed:.1f}s "
+            f"({state['chunk_count']} chunks)"
+        )
+    else:
+        kb = len(state["wav_bytes"] or b"") / 1024
+        assistant_content.append(f"{elapsed:.1f}s | {kb:.0f} KB")
 
-    # Final yield updates history only.  Do NOT re-send the full audio —
-    # gr.Audio(streaming=True) accumulates all prior chunk yields internally,
-    # so sending the concatenated waveform again would duplicate the playback.
-    yield pending_history, None
+    history[-1] = {"role": "assistant", "content": assistant_content}
+    return history
 
 
 # ---------------------------------------------------------------------------
@@ -199,6 +208,9 @@ def create_demo(api_base: str) -> gr.Blocks:
             "Subsequent requests are much faster thanks to KV cache reuse.*",
             elem_classes=["note"],
         )
+
+        # Hidden state passed between the prepare → synthesize → finalize chain.
+        synth_state = gr.State(None)
 
         with gr.Row():
             # Left column: input controls
@@ -268,7 +280,17 @@ def create_demo(api_base: str) -> gr.Blocks:
                 )
                 clear_btn = gr.Button("Clear History")
 
-        # -- Event wiring --
+        # -- Event wiring via .then() chaining --
+        #
+        # The chain is:
+        #   1. _prepare  → updates chatbot + synth_state  (non-generator)
+        #   2. _synthesize → yields audio chunks           (generator, audio_output only)
+        #   3. _finalize → updates chatbot with result     (non-generator)
+        #
+        # Crucially, the audio generator (_synthesize) targets ONLY audio_output.
+        # This prevents the gr.Audio(streaming=True) component from resetting its
+        # internal accumulation buffer on each chatbot re-render, which was the
+        # root cause of audio degrading to noise after the first prebuffered chunk.
 
         all_inputs = [
             stream_toggle,
@@ -282,22 +304,44 @@ def create_demo(api_base: str) -> gr.Blocks:
             chatbot,
         ]
 
-        def handler(*args):
-            yield from _dispatch(*args, api_base=api_base)
+        def prepare(*args):
+            return _prepare(*args)
 
-        synth_btn.click(
-            fn=handler,
-            inputs=all_inputs,
-            outputs=[chatbot, audio_output],
+        def synthesize(state):
+            yield from _synthesize(state, api_base=api_base)
+
+        def finalize(history, state):
+            return _finalize(history, state)
+
+        def _wire_chain(trigger):
+            trigger.then(
+                fn=synthesize,
+                inputs=[synth_state],
+                outputs=[audio_output],
+            ).then(
+                fn=finalize,
+                inputs=[chatbot, synth_state],
+                outputs=[chatbot],
+            )
+
+        _wire_chain(
+            synth_btn.click(
+                fn=prepare,
+                inputs=all_inputs,
+                outputs=[chatbot, synth_state],
+            )
         )
-        text_input.submit(
-            fn=handler,
-            inputs=all_inputs,
-            outputs=[chatbot, audio_output],
+        _wire_chain(
+            text_input.submit(
+                fn=prepare,
+                inputs=all_inputs,
+                outputs=[chatbot, synth_state],
+            )
         )
+
         clear_btn.click(
-            fn=lambda: ([], None),
-            outputs=[chatbot, audio_output],
+            fn=lambda: ([], None, None),
+            outputs=[chatbot, audio_output, synth_state],
         )
 
     return demo
